@@ -70,6 +70,42 @@ STREET_LIKE = {
 METRO_MERGE = {"تجریش": "تهران", "شمیرانات": "تهران", "شمیران": "تهران"}
 
 
+_NBH_STOP = (r"(?:خیابان|خ |کوچه|بلوار|میدان|بزرگراه|اتوبان|جاده|پلاک|بن ?بست|نبش|طبقه|بلوک|"
+             r"ساختمان|مجتمع|روبروی|جنب|بعد|قبل|،|,|-)")
+_NBH_RX = re.compile(r"منطقه\s+(.+?)\s*" + _NBH_STOP)
+
+
+def extract_neighborhoods(df):
+    """Neighborhood of each address:
+    1) from the standard Post (GNAF) address format: «... منطقه <neighborhood> خیابان ...»
+    2) a vote over records with the same postal-code prefix (7, 6 or 5 digits) in the same city
+    3) a known neighborhood name of that city as a whole word in the address
+    4) otherwise: postal area (first 5 digits)"""
+    nbh = df["address"].map(lambda a: (m.group(1).strip() if (m := _NBH_RX.search(a + " ،")) else None))
+    nbh = nbh.where(nbh.str.len().between(2, 40))
+    method = pd.Series(np.where(nbh.notna(), "address", ""), index=df.index)
+    t = df[nbh.notna() & df.postal_valid].assign(nbh=nbh)
+    for k in (7, 6, 5):
+        m = nbh.isna() & df.postal_valid
+        vc = (t.groupby(["city", t.postal.str[:k]]).nbh
+                .agg(lambda s: s.value_counts().index[0] if s.value_counts(normalize=True).iloc[0] >= 0.6 else None)
+                .dropna())
+        key = pd.MultiIndex.from_arrays([df.loc[m, "city"], df.loc[m, "postal"].str[:k]])
+        hit = pd.Series(vc.reindex(key).values, index=df.index[m]).dropna()
+        nbh[hit.index] = hit
+        method[hit.index] = f"postal ({k} digits)"
+    known = t.groupby("city").nbh.agg(lambda s: sorted({x for x in s if len(x) >= 4}, key=len, reverse=True))
+    for i in df.index[nbh.isna()]:
+        a = df.at[i, "address"]
+        for x in known.get(df.at[i, "city"], []):
+            if re.search(rf"(?:^|[\s،,.\-/]){re.escape(x)}(?=$|[\s،,.\-/])", a):
+                nbh[i] = x; method[i] = "name in address"; break
+    rest = nbh.isna()
+    nbh[rest] = np.where(df.loc[rest, "postal_valid"], "postal area " + df.loc[rest, "postal"].str[:5], "unknown")
+    method[rest] = "postal area"
+    return nbh, method
+
+
 def categorize(name):
     for cat, pat in CATEGORY_RULES:
         if re.search(pat, name, flags=re.I):
@@ -104,7 +140,9 @@ def main():
 
     # ---- postal code ----
     df["postal"] = df["postal"].map(norm).str.replace(r"\D", "", regex=True)
-    df["postal_valid"] = df["postal"].str.fullmatch(r"[1-9]\d{9}")
+    # 10 digits, not starting with 0, and not a placeholder code (1234567890, 1111111111, ...)
+    df["postal_valid"] = (df["postal"].str.fullmatch(r"[1-9]\d{9}")
+                          & ~df["postal"].map(lambda p: bool(re.search(r"(\d)\1{5}|123456|987654", p))))
     flag(~df["postal_valid"], "invalid postal code")
     log["invalid_postal"] = int((~df["postal_valid"]).sum())
 
@@ -176,9 +214,20 @@ def main():
     df["city"] = [METRO_MERGE.get(c, c) for c in city]
     df["city_method"] = method
     df["province"] = [prov_fix.get(city_prov.get(c, p), p) for c, p in zip(df["city"], df["province_raw"])]
+    # County: the most common county of each city (from the trusted rows)
+    ref = df[trusted]
+    city_county = ref.groupby(["province", "city"])["county_raw"].agg(lambda s: s.value_counts().index[0])
+    key = pd.MultiIndex.from_frame(df[["province", "city"]])
+    df["county"] = pd.Series(city_county.reindex(key).values, index=df.index).fillna(df["county_raw"])
+    df.loc[df["city"].eq("تهران"), "county"] = "تهران"
+
     changed = df["city"].ne(df["city_raw"])
     flag(changed, "city corrected")
     flag(df["province"].ne(df["province_raw"]), "province corrected")
+    flag(df["county"].ne(df["county_raw"]), "county corrected")
+    log["county_changed"] = int(df["county"].ne(df["county_raw"]).sum())
+
+    df["neighborhood"], df["nbh_method"] = extract_neighborhoods(df)
     log["city_changed"] = int(changed.sum())
     log["city_unconfirmed"] = int(df["city_method"].str.startswith("original label").sum())
 
