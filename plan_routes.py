@@ -1,8 +1,11 @@
 """
 Step 2: cluster each city into visitor territories and daily routes, and order the visits.
 
-    python plan_routes.py                        # both versions (pharmacies only / all centers)
-    python plan_routes.py --per-day 8 --days 22  # visitor capacity
+    python plan_routes.py                                   # both versions (pharmacies only / all centers)
+    python plan_routes.py --hours 9 --days-per-week 5 --weeks 4
+
+Capacity is time-based: each day is 9 hours (minus a break), filled with travel time (by city size
+and traffic, see timing.py) plus time inside the pharmacy (30 minutes crowded / 20 minutes quiet).
 
 If work/geocode.csv (output of geocode_neshan.py) exists, the geographic mode runs:
 balanced k-means + a shortest path (nearest neighbor + 2-opt) on real coordinates.
@@ -16,6 +19,9 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 
+from timing import (CLASSES, DayClock, build_days, city_profiles, day_schedule, haversine_km, hhmm,
+                    service_minutes)
+
 ROOT = Path(__file__).parent
 WORK = ROOT / "work"
 OUT = ROOT / "output"
@@ -28,6 +34,24 @@ def to_xy(lat, lon):
     """Local projection to kilometers (accurate enough within a single city)."""
     lat0 = np.radians(np.nanmean(lat))
     return np.column_stack([np.radians(lon) * 6371 * np.cos(lat0), np.radians(lat) * 6371])
+
+
+def hilbert_index(lat, lon, order=16):
+    """Position on a Hilbert curve: points close on the curve are close on the map."""
+    n = 1 << order
+    x = ((lon - lon.min()) / max(np.ptp(lon), 1e-9) * (n - 1)).astype(np.int64)
+    y = ((lat - lat.min()) / max(np.ptp(lat), 1e-9) * (n - 1)).astype(np.int64)
+    d = np.zeros(len(x), np.int64)
+    s = n // 2
+    while s > 0:
+        rx = (x & s) > 0
+        ry = (y & s) > 0
+        d += s * s * ((3 * rx) ^ ry)
+        flip = ~ry
+        x, y = np.where(flip & rx, s - 1 - x, x), np.where(flip & rx, s - 1 - y, y)
+        x, y = np.where(flip, y, x), np.where(flip, x, y)
+        s //= 2
+    return d
 
 
 def path_len(xy, order):
@@ -202,177 +226,294 @@ def pack(units, cap):
     return groups
 
 
-def build_territories(df, cap):
-    """Territory = a big city on its own; small cities are grouped within their own county; leftover
-    small cities in a county with a big city join that city ("و اطراف"); still-small groups are joined
-    with neighboring counties in the same province."""
-    df["territory"] = ""
-    tkey = {}                                            # territory -> its first key (for proximity)
-    sizes = df.groupby(["province", "county", "city"]).size()
-    for (p, c, t), n in sizes.items():
-        if n >= cap * 0.75:
-            m = (df.province == p) & (df.county == c) & (df.city == t)
-            df.loc[m, "territory"] = f"شهر {t}"
-    for p, gp in df[df.territory == ""].groupby("province"):
-        groups = []                                      # [counties, mask, size, key]
-        for c, gc in gp.groupby("county"):
-            cities = gc.groupby("city")["_key"].agg(["min", "size"]).sort_values("min")
-            for grp in pack(list(zip(cities.index, cities["size"])), cap):
-                m = (df.province == p) & (df.county == c) & df.city.isin(grp) & (df.territory == "")
-                n = int(m.sum())
-                big = df[(df.province == p) & (df.county == c) & (df.territory != "")]
-                if n < cap * 0.5 and len(big):
-                    # Attach to the smallest big-city territory of the same county
-                    host = big.territory.value_counts().index[-1]
-                    df.loc[df.province.eq(p) & df.territory.eq(host), "territory"] = host + " و اطراف"
-                    df.loc[m, "territory"] = host + " و اطراف" if not host.endswith("و اطراف") else host
+MAX_RADIUS_KM = 60          # farthest town of a territory from its main town (daily return trip)
+
+
+def build_territories(df, cap, towns):
+    """Territories in the hierarchy province > county > city, with geographic limits:
+    1) a city whose workload is at least 75% of one visitor -> its own territory («شهر X»)
+    2) small towns of a county -> geographic groups around the biggest town (radius MAX_RADIUS_KM)
+    3) a small group (< 50% of capacity) -> joins the nearest group/big city of the same county, else
+       of a neighboring county in the same province, if it is within the radius and capacity
+    Workload = estimated minutes (_work); towns has town coordinates (_tlat/_tlon)."""
+    keys = ["province", "county", "city"]
+    t = (df.groupby(keys)["_work"].sum().rename("work").reset_index()
+         .merge(towns, on=keys, how="left"))
+    t["lat"] = t["lat"].fillna(t.groupby(["province", "county"])["lat"].transform("mean"))
+    t["lon"] = t["lon"].fillna(t.groupby(["province", "county"])["lon"].transform("mean"))
+    def dist(a, b):
+        if np.isfinite([a.lat, a.lon, b.lat, b.lon]).all():
+            return haversine_km(a.lat, a.lon, b.lat, b.lon)
+        return 0.0 if a.county == b.county else 1e6     # no coordinates: only within the same county
+
+    groups = []                                          # dict(towns=[idx], work, base=idx, big)
+    for i in t.index[t.work >= cap * 0.75]:
+        groups.append({"towns": [i], "work": t.work[i], "base": i, "big": True})
+    for (p, c), gc in t[t.work < cap * 0.75].groupby(["province", "county"]):
+        left = list(gc.sort_values("work", ascending=False).index)
+        while left:
+            seed = left.pop(0)
+            g = {"towns": [seed], "work": t.work[seed], "base": seed, "big": False}
+            for j in sorted(left, key=lambda j: dist(t.loc[seed], t.loc[j])):
+                if dist(t.loc[seed], t.loc[j]) <= MAX_RADIUS_KM and g["work"] + t.work[j] <= cap:
+                    g["towns"].append(j); g["work"] += t.work[j]
+            left = [j for j in left if j not in g["towns"]]
+            groups.append(g)
+
+    # Join small groups: same county first, then the same province
+    changed = True
+    while changed:
+        changed = False
+        for g in sorted([g for g in groups if g["work"] < cap * 0.5], key=lambda g: g["work"]):
+            if g not in groups:
+                continue
+            b = t.loc[g["base"]]
+            best = None
+            for h in groups:
+                if h is g or t.province[h["base"]] != b.province:
                     continue
-                groups.append(([c], m, n, cities.loc[grp, "min"].min()))
-        groups.sort(key=lambda x: x[3])
-        units = [(i, g[2] if g[2] < cap * 0.5 else cap) for i, g in enumerate(groups)]
-        packed = pack(units, cap)
-        # A group that is still very small (< 25% of capacity) joins its neighbor in province order
-        i = 0
-        while i < len(packed):
-            if len(packed) > 1 and sum(groups[j][2] for j in packed[i]) < cap * 0.25:
-                nb = i - 1 if i > 0 else i + 1
-                packed[nb] = sorted(packed[nb] + packed[i]); packed.pop(i)
-                i = max(0, i - 1)
-            else:
-                i += 1
-        for grp in packed:
-            label = "شهرستان " + "، ".join(dict.fromkeys(c for j in grp for c in groups[j][0]))
-            for j in grp:
-                df.loc[groups[j][1], "territory"] = label
+                hb = t.loc[h["base"]]
+                far = max(dist(hb, t.loc[j]) for j in g["towns"])
+                fits = h["work"] + g["work"] <= cap or h["big"]   # a big city may grow into one more visitor
+                if far <= MAX_RADIUS_KM and fits:
+                    score = (hb.county != b.county, far)
+                    if best is None or score < best[0]:
+                        best = (score, h)
+            if best:
+                h = best[1]
+                h["towns"] += g["towns"]; h["work"] += g["work"]
+                groups.remove(g); changed = True
+
+    df["territory"], df["_base"] = "", None
+    for g in groups:
+        b = t.loc[g["base"]]
+        members = t.loc[g["towns"]]
+        if g["big"]:
+            label = f"شهر {b.city}" + (" و اطراف" if len(members) > 1 else "")
+        elif len(members) == 1:
+            label = f"شهر {b.city}"
+        else:
+            label = f"حوزه {b.city} (شهرستان " + "، ".join(dict.fromkeys(members.county)) + ")"
+        for _, m in members.iterrows():
+            sel = (df.province == m.province) & (df.county == m.county) & (df.city == m.city)
+            df.loc[sel, "territory"] = label
+            df.loc[sel, "_base"] = pd.Series([(b.province, b.county, b.city)] * sel.sum(),
+                                             index=df.index[sel], dtype=object)
     return df
 
 
-def plan(df, per_day, days):
-    cap = per_day * days
+def town_order(g, P, base):
+    """Order of the towns of a territory: start at the main town, then the nearest unvisited town."""
+    towns = list(dict.fromkeys(g._town))
+    order, left = [base], [x for x in towns if x != base]
+    while left:
+        cur = P[order[-1]]
+        d = [haversine_km(cur.lat, cur.lon, P[x].lat, P[x].lon) for x in left]
+        d = [x if np.isfinite(x) else 1e6 for x in d]
+        order.append(left.pop(int(np.argmin(d))))
+    return {x: i for i, x in enumerate(order)}
+
+
+WEEKDAYS = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه"]
+
+
+def plan(df, prof, a):
+    budget = a.hours * 60 - a.break_min                 # working minutes per day
+    cycle_days = a.days_per_week * a.weeks              # working days per visit cycle
     df = df.copy()
     df["_key"] = hierarchy_key(df)
-    df = build_territories(df, cap)
-    rows = []
-    vid = 0
+    df["_town"] = list(zip(df.province, df.county, df.city))
+    df["service_min"], df["crowded"] = service_minutes(df, prof)
+    P = prof.set_index(["province", "county", "city"])
+    P.index = P.index.to_flat_index()
+    pt = P.loc[df["_town"]]
+    df["_work"] = (df.service_min.values + pt.hop_km.values / pt.speed_kmh.values * 60 + pt.parking_min.values
+                   + pt.commute_km.values / pt.speed_kmh.values * 60 / 10)
+    df = build_territories(df, cycle_days * budget, prof[["province", "county", "city", "lat", "lon"]])
+    start = int(a.start[:2]) * 60 + int(a.start[3:])
+    clock_prof = dict(zip(P.index, P.itertuples(index=False)))
+    # Phase 1: daily routes of each territory (each day starts from the territory's main town)
+    terrs = []
     for (prov, terr), g in df.groupby(["province", "territory"], sort=True):
-        g = g.sort_values("_key").reset_index(drop=True)
-        n = len(g)
-        k = math.ceil(n / cap)                         # minimum visitor count without exceeding capacity
-        per_v = math.ceil(n / k)
-        # Geographic mode if at least 90% of the points have coordinates; the rest get the territory center
+        base = g._base.iloc[0]                           # the visitors' base: the territory's main town
+        rank = town_order(g, clock_prof, base)
+        g = (g.assign(_o=g._town.map(rank)).sort_values(["_o", "_key"]).drop(columns="_o")
+               .reset_index(drop=True))
         geo = g.lat.notna().mean() >= 0.9
         if geo:
             g[["lat", "lon"]] = g[["lat", "lon"]].fillna(g[["lat", "lon"]].mean())
-            xy = to_xy(g.lat.values, g.lon.values)
-            vlab = balanced_kmeans(xy, k, per_v)
-            # Number the visitors in the hierarchy order (the first member of each cluster)
-            first = [g._key[vlab == v].min() for v in range(k)]
-            vlab = np.argsort(np.argsort(first))[vlab]
-        else:
-            vlab = postal_cuts(g._key.tolist(), k, per_v)
-        for v in range(k):
-            vid += 1
-            sub = g[vlab == v].sort_values("_key").reset_index(drop=True)
-            m = len(sub)
-            d = min(days, math.ceil(m / per_day))
-            if geo:
-                sxy = to_xy(sub.lat.values, sub.lon.values)
-                dlab = balanced_kmeans(sxy, d, math.ceil(m / d), seed=v)
-                dc = np.array([sxy[dlab == j].mean(0) for j in range(d)])
-                day_order = tsp_open(dc)                 # order of days: consecutive days stay in adjacent areas
-            else:
-                dlab = postal_cuts(sub._key.tolist(), d, per_day, win=3)
-                day_order = list(range(d))
-            for day_no, j in enumerate(day_order, 1):
-                idx = np.flatnonzero(dlab == j)
-                if geo:
-                    order = [idx[i] for i in tsp_open(sxy[idx])]
-                    km = path_len(sxy, order) * ROAD_FACTOR
-                else:
-                    order = sorted(idx, key=lambda i: sub._key[i])
-                    km = np.nan
-                for stop, i in enumerate(order, 1):
-                    r = sub.loc[i].to_dict()
-                    r.update(visitor=f"V{vid:04d}", visitor_in_territory=v + 1, day=day_no,
-                             group=f"V{vid:04d}-روز{day_no:02d}", stop=stop,
-                             day_km=round(km, 1) if stop == 1 and geo else np.nan,
-                             mode="geographic" if geo else "postal code + neighborhood")
-                    rows.append(r)
-    return pd.DataFrame(rows)
+            # With coordinates, the order within each town follows a Hilbert curve (neighbors stay together)
+            g["_h"] = hilbert_index(g.lat.values, g.lon.values)
+            g = (g.assign(_o=g._town.map(rank)).sort_values(["_o", "_h"]).drop(columns=["_o", "_h"])
+                   .reset_index(drop=True))
+        clock = DayClock(P, base, geo)
+        days = build_days(g.to_dict("records"), clock, budget)
+        if geo:                                          # shortest order inside each day (same town)
+            for i, d in enumerate(days):
+                if len(d) > 2 and len({r["_town"] for r in d}) == 1:
+                    xy = to_xy(np.array([r["lat"] for r in d]), np.array([r["lon"] for r in d]))
+                    days[i] = [d[j] for j in tsp_open(xy)]
+        terrs.append(dict(prov=prov, terr=terr, base=base, days=days, clock=clock, geo=geo, rank=rank))
+
+    # Phase 2: visitors. A big territory gets its own visitor(s); small territories of one province are
+    # chained geographically (nearest main town) and packed into one visitor while the days fit the cycle.
+    plans = []                                           # (list of (territory, day))
+    for prov in dict.fromkeys(t["prov"] for t in terrs):
+        T = [t for t in terrs if t["prov"] == prov]
+        for t in [t for t in T if len(t["days"]) >= cycle_days * 0.75]:
+            k = math.ceil(len(t["days"]) / cycle_days)   # fewest visitors that cover all days in one cycle
+            keys_ = [f"{t['rank'][d[0]['_town']]:03d}{d[0]['_key']}" for d in t["days"]]
+            vlab = postal_cuts(keys_, k, cycle_days, win=2)
+            for v in range(k):
+                plans.append([(t, d) for d, l in zip(t["days"], vlab) if l == v])
+        small = sorted([t for t in T if len(t["days"]) < cycle_days * 0.75], key=lambda t: -len(t["days"]))
+        chain = small[:1]
+        left = small[1:]
+        while left:
+            c = clock_prof[chain[-1]["base"]]
+            dd = [haversine_km(c.lat, c.lon, clock_prof[t["base"]].lat, clock_prof[t["base"]].lon) for t in left]
+            dd = [x if np.isfinite(x) else 1e6 for x in dd]
+            chain.append(left.pop(int(np.argmin(dd))))
+        cur = []
+        for t in chain:
+            if cur and len(cur) + len(t["days"]) > cycle_days:
+                plans.append(cur); cur = []
+            cur += [(t, d) for d in t["days"]]
+        if cur:
+            plans.append(cur)
+
+    rows = []
+    for vid, vdays in enumerate(plans, 1):
+        n_terr = len({id(t) for t, _ in vdays})
+        for dn, (t, d) in enumerate(vdays, 1):
+            sch = day_schedule(d, t["clock"], start)
+            end = sch[-1]["leave_min"]
+            for stop, (r, s_) in enumerate(zip(d, sch), 1):
+                r = dict(r)
+                r.update(s_, territory=t["terr"], visitor=f"V{vid:04d}", visitor_territories=n_terr, day=dn,
+                         week=(dn - 1) // a.days_per_week + 1,
+                         weekday=WEEKDAYS[(dn - 1) % a.days_per_week],
+                         group=f"V{vid:04d}-روز{dn:02d}", stop=stop, visits_in_day=len(d),
+                         arrive=hhmm(s_["arrive_min"]), leave=hhmm(s_["leave_min"]), day_end=hhmm(end),
+                         day_work_min=round(end - start), base_town=t["base"][2],
+                         mode="geographic" if t["geo"] else "postal code + neighborhood")
+                rows.append(r)
+    out = pd.DataFrame(rows)
+    keys = ["province", "county", "city"]
+    return out.merge(prof[keys + ["population", "population_estimated", "city_class", "speed_kmh"]],
+                     on=keys, how="left")
 
 
 # ---------------------------------------------------------------- output
 FA = {
     "province": "استان", "county": "شهرستان", "city": "شهر", "neighborhood": "محله/ناحیه",
-    "group": "گروه (ویزیتور-روز)", "coord_source": "منبع مختصات", "nbh_method": "روش تعیین محله", "territory": "منطقه/قلمرو", "visitor": "کد ویزیتور",
-    "visitor_in_territory": "ویزیتور شماره (در قلمرو)", "day": "روز", "stop": "ترتیب ویزیت",
+    "population": "جمعیت شهر", "city_class": "اندازه شهر", "territory": "منطقه/قلمرو",
+    "visitor": "کد ویزیتور", "visitor_territories": "تعداد حوزه‌های ویزیتور", "base_town": "شهر مبدا روز",
+    "week": "هفته", "weekday": "روز هفته", "day": "روز کاری", "group": "گروه (ویزیتور-روز)",
+    "stop": "ترتیب ویزیت", "arrive": "ساعت رسیدن", "leave": "ساعت خروج", "travel_min": "زمان رفت (دقیقه)",
+    "travel_km": "مسافت رفت (کیلومتر)", "service_min": "زمان داخل داروخانه (دقیقه)",
+    "crowded": "منطقه شلوغ", "visits_in_day": "تعداد ویزیت روز", "day_end": "پایان کار روز",
     "gln": "کد جی ال ان", "name": "نام مرکز", "category": "نوع مرکز", "owner": "مالک/رابط",
     "postal": "کد پستی", "address": "آدرس", "lat": "عرض جغرافیایی", "lon": "طول جغرافیایی",
-    "day_km": "مسافت تقریبی روز (کیلومتر)", "mode": "روش مسیریابی", "city_raw": "شهر (اصلی فایل)",
-    "city_method": "روش تعیین شهر", "flags": "هشدارهای پاکسازی", "source_file": "فایل منبع",
+    "coord_source": "منبع مختصات", "mode": "روش مسیریابی", "city_raw": "شهر (اصلی فایل)",
+    "city_method": "روش تعیین شهر", "nbh_method": "روش تعیین محله", "flags": "هشدارهای پاکسازی",
+    "source_file": "فایل منبع",
+    "customers": "تعداد مشتری", "visitors": "تعداد ویزیتور", "groups": "تعداد گروه",
+    "counties": "شهرستان‌ها", "cities": "شهرها", "days": "تعداد روز کاری",
+    "visits_per_day": "میانگین ویزیت در روز", "km_per_day": "میانگین مسافت روز (کیلومتر)",
+    "travel_min_per_day": "میانگین زمان رانندگی روز (دقیقه)",
+    "service_min_per_day": "میانگین زمان داخل داروخانه روز (دقیقه)",
+    "work_min_per_day": "میانگین کل زمان کار روز (دقیقه)", "utilization_%": "درصد ظرفیت (روزها)",
+    "avg_service_min": "میانگین زمان ویزیت (دقیقه)", "avg_travel_min": "میانگین زمان رفت (دقیقه)",
+    "speed_kmh": "سرعت متوسط ترافیک (km/h)", "area_km2": "مساحت تخمینی (km²)",
+    "hop_km": "فاصله تخمینی بین دو داروخانه (km)", "records": "تعداد رکورد",
+    "population_estimated": "جمعیت تخمینی؟",
 }
 
 
-def write(plan_df, excluded, path, per_day, days):
-    cols = ["province", "county", "city", "neighborhood", "territory", "visitor", "visitor_in_territory",
-            "day", "group", "stop", "gln", "name", "category", "owner", "postal", "address", "lat", "lon",
-            "coord_source", "day_km", "mode", "city_raw", "city_method", "nbh_method", "flags", "source_file"]
-    routes = plan_df[cols].sort_values(["province", "county", "city", "visitor", "day", "stop"])
-    vis = (plan_df.groupby(["province", "territory", "visitor"])
-           .agg(counties=("county", lambda s: "، ".join(dict.fromkeys(s))),
-                cities=("city", lambda s: "، ".join(dict.fromkeys(s))), customers=("gln", "size"),
-                days=("day", "max"), km_total=("day_km", lambda s: s.sum(min_count=1)))
-           .reset_index())
-    vis["utilization_%"] = (vis.customers / (per_day * days) * 100).round(0)
-    city = (plan_df.groupby(["province", "county", "city"])
-            .agg(customers=("gln", "size"), visitors=("visitor", "nunique"), territory=("territory", "first"))
-            .reset_index().sort_values(["province", "county", "customers"], ascending=[True, True, False]))
-    nbh = (plan_df.groupby(["province", "county", "city", "neighborhood"])
+def write(p, excluded, prof, path, a):
+    cols = ["province", "county", "city", "population", "city_class", "neighborhood", "territory", "visitor",
+            "visitor_territories", "base_town", "week", "weekday", "day", "group", "stop", "arrive", "leave",
+            "travel_min", "travel_km", "service_min", "crowded", "visits_in_day", "day_end", "gln", "name",
+            "category", "owner", "postal", "address", "lat", "lon", "coord_source", "mode", "city_raw",
+            "city_method", "nbh_method", "flags", "source_file"]
+    routes = p[cols].sort_values(["province", "county", "city", "visitor", "day", "stop"])
+    days = (p.groupby(["visitor", "day"])
+            .agg(visits=("gln", "size"), km=("travel_km", "sum"), travel=("travel_min", "sum"),
+                 service=("service_min", "sum"), work=("day_work_min", "first"))
+            .reset_index())
+    per_v = (days.groupby("visitor")
+             .agg(visits_per_day=("visits", "mean"), km_per_day=("km", "mean"),
+                  travel_min_per_day=("travel", "mean"), service_min_per_day=("service", "mean"),
+                  work_min_per_day=("work", "mean"))
+             .round(1).reset_index())
+    vis = (p.groupby(["province", "visitor"])
+           .agg(territory=("territory", lambda s: " | ".join(dict.fromkeys(s))), counties=("county", lambda s: "، ".join(dict.fromkeys(s))),
+                cities=("city", lambda s: "، ".join(dict.fromkeys(s))),
+                city_class=("city_class", lambda s: s.mode().iloc[0]), customers=("gln", "size"),
+                days=("day", "max"))
+           .reset_index().merge(per_v, on="visitor"))
+    vis["utilization_%"] = (vis.days / (a.days_per_week * a.weeks) * 100).round(0)
+    keys = ["province", "county", "city"]
+    vpd = (p.groupby(keys + ["visitor", "day"]).size().groupby(keys).mean()
+           .round(1).rename("visits_per_day").reset_index())
+    city = (p.groupby(keys + ["population", "city_class"])
+            .agg(customers=("gln", "size"), visitors=("visitor", "nunique"), territory=("territory", "first"),
+                 avg_service_min=("service_min", "mean"), avg_travel_min=("travel_min", "mean"))
+            .round(1).reset_index().merge(vpd, on=keys)
+            .sort_values(["province", "county", "customers"], ascending=[True, True, False]))
+    order = {c[1]: i for i, c in enumerate(CLASSES)}
+    cls = (vis.groupby("city_class")
+           .agg(visitors=("visitor", "size"), customers=("customers", "sum"),
+                visits_per_day=("visits_per_day", "mean"), km_per_day=("km_per_day", "mean"),
+                travel_min_per_day=("travel_min_per_day", "mean"),
+                service_min_per_day=("service_min_per_day", "mean"), work_min_per_day=("work_min_per_day", "mean"))
+           .round(1).reset_index().sort_values("city_class", key=lambda s: s.map(order)))
+    nbh = (p.groupby(keys + ["neighborhood"])
            .agg(customers=("gln", "size"), visitors=("visitor", lambda s: "، ".join(sorted(set(s)))),
                 groups=("group", "nunique"))
            .reset_index())
-    city["customers_per_visitor"] = (city.customers / city.visitors).round(0)
+    params = prof[keys + ["population", "population_estimated", "city_class", "speed_kmh", "area_km2",
+                          "hop_km", "records"]].round(2)
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
-        routes.rename(columns=FA).to_excel(xw, sheet_name="برنامه ویزیت", index=False)
-        nbh.rename(columns={**FA, "customers": "تعداد مشتری", "visitors": "ویزیتورها", "groups": "تعداد گروه"}
-                   ).to_excel(xw, sheet_name="استان-شهرستان-شهر-محله", index=False)
-        vis.rename(columns={**FA, "counties": "شهرستان‌ها", "cities": "شهرها", "customers": "تعداد مشتری", "days": "تعداد روز",
-                            "km_total": "مسافت کل تقریبی (کیلومتر)", "utilization_%": "درصد ظرفیت"}
-                   ).to_excel(xw, sheet_name="خلاصه ویزیتورها", index=False)
-        city.rename(columns={**FA, "customers": "تعداد مشتری", "visitors": "تعداد ویزیتور",
-                             "customers_per_visitor": "مشتری به ازای هر ویزیتور"}
-                    ).to_excel(xw, sheet_name="خلاصه شهرها", index=False)
-        if len(excluded):
-            excluded.rename(columns=FA).to_excel(xw, sheet_name="خارج از برنامه", index=False)
+        for df_, name in [(routes, "برنامه ویزیت"), (cls, "مقایسه اندازه شهرها"), (vis, "خلاصه ویزیتورها"),
+                          (city, "خلاصه شهرها"), (nbh, "استان-شهرستان-شهر-محله"), (params, "پارامترهای شهرها"),
+                          (excluded, "خارج از برنامه")]:
+            if len(df_):
+                df_.rename(columns=FA).to_excel(xw, sheet_name=name, index=False)
         for ws in xw.book.worksheets:
             ws.sheet_view.rightToLeft = True
             ws.freeze_panes = "A2"
             for col in ws.columns:
                 w = max(len(str(c.value or "")) for c in list(col)[:300])
                 ws.column_dimensions[col[0].column_letter].width = min(60, max(8, w + 2))
-    return vis, city
+    return vis, cls
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--per-day", type=int, default=8)
-    ap.add_argument("--days", type=int, default=22)
+    ap.add_argument("--hours", type=float, default=9, help="hours at work per day")
+    ap.add_argument("--break-min", type=float, default=30, help="lunch/prayer break per day (minutes)")
+    ap.add_argument("--days-per-week", type=int, default=5)
+    ap.add_argument("--weeks", type=int, default=4, help="length of the visit cycle (each customer once)")
+    ap.add_argument("--start", default="08:00", help="start time of the working day")
     ap.add_argument("--geocode-file", default=str(WORK / "geocode.csv"))
     a = ap.parse_args()
     OUT.mkdir(exist_ok=True)
 
     df = pd.read_pickle(WORK / "clean.pkl")
+    pop = pd.read_csv(ROOT / "data" / "city_population.csv")
     dups = df[df.is_duplicate].assign(reason="duplicate")
     df = attach_coords(df[~df.is_duplicate].copy(), Path(a.geocode_file))
     print("coordinates:", df.coord_source.replace("", "none").value_counts().to_dict())
 
     for tag, keep in [("pharmacies_only", df.is_pharmacy), ("all_centers", df.is_pharmacy | True)]:
         excluded = pd.concat([df[~keep].assign(reason="not a pharmacy: " + df.category), dups])
-        p = plan(df[keep], a.per_day, a.days)
-        vis, city = write(p, excluded, OUT / f"visit_plan_{tag}.xlsx", a.per_day, a.days)
-        print(f"\n== {tag}: {len(p)} customers, {vis.visitor.nunique()} visitors, "
-              f"average utilization {vis['utilization_%'].mean():.0f}%")
-        print(city.sort_values("customers", ascending=False).head(8).to_string(index=False))
+        prof = city_profiles(df[keep], pop)
+        p = plan(df[keep], prof, a)
+        vis, cls = write(p, excluded, prof, OUT / f"visit_plan_{tag}.xlsx", a)
+        print(f"\n== {tag}: {len(p)} customers, {vis.visitor.nunique()} visitors")
+        print(cls.to_string(index=False))
 
 
 if __name__ == "__main__":
