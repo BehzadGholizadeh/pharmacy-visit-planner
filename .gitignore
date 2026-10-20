@@ -1,0 +1,7 @@
+# Intermediate cache (rebuilt from clean.py)
+work/*.pkl
+__pycache__/
+*.pyc
+# Neshan geocoding cache may be large; uncomment if not needed in the repo
+# work/geocode.csv
+~$*.xlsx
