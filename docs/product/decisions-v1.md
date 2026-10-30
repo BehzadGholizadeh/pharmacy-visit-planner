@@ -1,8 +1,8 @@
 # Product Decisions – Driver & Visitor Modules (v1)
 
 **Date:** 2026-10-30  
-**Status:** Approved by Product Owner (via chat)  
-**Timezone:** Asia/Tehran (explicit)
+**Status:** Product-owner decisions and proposals; see the Decision Register for each item's approval state.  
+**Timezone:** Asia/Tehran
 
 ---
 
@@ -12,90 +12,94 @@ There are **two distinct roles**:
 
 | Role | Persian | Responsibility |
 |------|---------|----------------|
-| **Visitor** | ویزیتور | Goes to the pharmacy, takes orders / does the visit |
-| **Driver** | راننده | Loads the goods according to confirmed orders and delivers them |
+| **Visitor** | ویزیتور | Visits pharmacies and takes orders / performs the visit |
+| **Driver** | راننده | Loads goods for confirmed orders and delivers them |
 
-- One person can potentially have both roles over time, but the system treats them as separate assignments.
-- A Visitor plan and a Driver plan are independent.
-- The Driver sees the **delivery route** based on the current order/delivery status, not the original visit plan.
+- One person may potentially hold both roles over time, but the system treats the roles and assignments separately.
+- A Visitor plan and a Driver delivery plan are independent.
+- The Driver sees a **delivery route** based on orders that are confirmed and ready for delivery, not the original Visitor visit plan.
 
----
+## 2. Plan Independence (Confirmed)
 
-## 2. Plan Independence
+- Visitor plans are generated and updated independently.
+- Driver delivery plans are generated from confirmed / ready-to-deliver orders.
+- The delivery-planning workflow is separate from the existing Python Visitor Planning algorithm.
+- New orders, cancellations, stock changes and manager reassignment may affect a delivery plan **before the relevant driver's shift starts**.
+- The existing Visitor Planning algorithm and its behavior must not be changed as part of the Driver app work.
 
-- Visit plans (for Visitors) are generated and updated independently.
-- Delivery plans (for Drivers) are generated based on **confirmed / ready-to-deliver orders**.
-- Routes are **not permanently fixed**. They can change between cycles or even mid-cycle based on:
-  - New orders
-  - Cancelled orders
-  - Stock availability
-  - Traffic / operational constraints
-  - Manager re-assignment
+## 3. Route Change Timing and Daily Lock (Confirmed)
 
----
+**A driver's route is finalized before the driver's working day/shift begins. Route changes do not take place during the working day.**
 
-## 3. Driver Workflow (High-level)
+- Route order, stop membership and driver assignment must be finalized and published before the shift starts.
+- When the driver starts the shift, the assigned route version becomes the active, locked route for that shift.
+- The app and backend must not reorder stops, add/remove stops, or reassign the active route during that shift.
+- Operational outcomes during the day (for example delivered, partial, failed, returned, customer unavailable or vehicle issue) are recorded as delivery events against the locked route. They do not modify the route sequence.
+- A failed or exceptional delivery is handled through its delivery status and the agreed manager follow-up process; it is not automatically converted into a same-day route change.
+- Any new planning/reassignment is performed before a future shift/working day.
 
-1. Driver opens the app before starting the shift.
-2. Sees the list of deliveries that are **ready** (based on order status).
-3. Loads the goods.
-4. Starts the route (ordered stops).
-5. Delivers, marks status (Delivered / Failed / Partial / Returned).
-6. Syncs when network is available.
+This rule replaces any earlier wording that allowed a new route version to be pushed, acknowledged or applied while a driver was already on the road.
 
----
+## 4. Driver Workflow (High-level)
 
-## 4. Calendar & Working Days (Confirmed)
+1. Before the shift, the manager/planning process finalizes and assigns the delivery route.
+2. The driver opens the app and sees the route assigned for the current working day.
+3. The driver reviews the stops and the orders/items expected at each stop.
+4. The driver loads goods according to the approved delivery manifest and records any required loading discrepancy.
+5. The driver starts the shift; the route version is locked for that shift.
+6. The driver follows the ordered stops and records delivery outcomes (Delivered / Partially Delivered / Failed / Returned, subject to the approved state model).
+7. Events are saved locally and synchronized when network access is available.
+
+## 5. Calendar & Working Days (Confirmed)
 
 - **Timezone:** `Asia/Tehran`
 - **Working days:** Saturday, Sunday, Monday, Tuesday, Wednesday
-- **Non-working days:**
-  - Thursday
-  - Friday
-  - Official Iranian public holidays (تقویم رسمی ایران)
+- **Non-working days:** Thursday, Friday and official Iranian public holidays.
 
-Any generated plan must respect this calendar.
+Any delivery plan must respect this calendar. The authoritative holiday-calendar source and manager override process still need to be specified.
 
----
+## 6. Unfinished Deliveries (Open – Do Not Assume Automatic Carry-Over)
 
-## 5. Unfinished Visits / Deliveries – Recommendation
+A blanket automatic carry-over policy has **not** been approved.
 
-**Recommended policy (for approval):**
+The handling of an unfinished delivery must consider:
+- The delivery outcome/reason.
+- Whether the order was loaded and dispatched.
+- Whether all or only some order lines were delivered.
+- Whether the order was cancelled, returned, refused or is still eligible for retry.
+- Whether manager review or reassignment is required.
 
-| Situation | Behavior |
-|-----------|----------|
-| Stop not completed by end of day | Marked as **Overdue** |
-| Next working day | Automatically appears at the top of the new day’s list (or in a separate “Overdue” section) with higher priority |
-| After 2 consecutive working days still open | Requires **Manager action** (re-assign, cancel, or force complete) |
-| Manager can always manually move, cancel or re-assign any open stop |
+Do not automatically put every unfinished stop at the top of the next day's route. Define a reason-aware policy and obtain Product Owner approval before implementing automatic carry-over.
 
-This keeps the system automatic for normal cases while giving the manager control for exceptions.
+## 7. Route Identity and Versioning (Recommended)
 
----
-
-## 6. Route Versioning (Recommended)
-
-Every published route must have:
+Every published delivery route should have:
 - `route_id`
 - `version`
+- `service_date` (actual calendar date, not only a cycle-relative day)
 - `published_at`
-- `assigned_to` (driver or visitor account)
+- `assigned_driver_id`
 - `status`: Draft → Published → Assigned → Active → Completed / Cancelled / Superseded
+- `locked_at` or equivalent shift-start marker
 
-If a new version is published while the driver is already on the road:
-- Driver receives a notification.
-- Must acknowledge the change.
-- Already completed stops are preserved.
-- Remaining stops are replaced by the new version.
+Recommended behavior:
+- A new version may replace a previously published route **only before the driver's shift starts**.
+- The driver downloads the latest assigned version before starting the shift.
+- At shift start, the route snapshot is locked and its route ID/version is attached to delivery events.
+- No mid-shift route-change notification or acknowledgement workflow is required because mid-shift route changes are not part of the operating model.
+
+## 8. Open Items Still Needing Decision
+
+- Authoritative source for confirmed/ready-to-deliver orders and order-line quantities.
+- Ownership and implementation boundary for importing/publishing delivery routes to the app.
+- Pharmacy/customer phone number source (not present in the reviewed `clean.py` source-column mapping).
+- Loading confirmation process (manual confirmation, item scan, quantity check, or another process).
+- Proof-of-delivery policy (recipient name, signature, photo, OTP, none, or a combination).
+- Exact delivery status/state machine and partial-delivery rules.
+- Reason-aware retry / unfinished-delivery policy.
+- Whether Driver and Visitor roles use one Android app with role-based experiences or separate app packages.
+- Whether live location sharing will ever be enabled; recommended to remain out of scope for the initial release.
 
 ---
 
-## 7. Open Items Still Needing Decision
-
-- Exact source of pharmacy phone numbers (currently missing in clean.py).
-- Whether photo proof is mandatory for delivery or optional.
-- Whether live location sharing will ever be enabled (currently recommended as non-goal).
-
----
-
-**Next step:** ChatGPT / product review of this decision document, then finalization of PRD v1.1 and data contract.
+**Next step:** finalize the open items and the delivery data contract, then approve the revised PRD and Phase 0 exit criteria. No implementation authorization is implied by this document.
