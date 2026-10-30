@@ -70,7 +70,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.8.3")
 
-    // Room's compiler runs through KSP; KSP remains even though Hilt is not used.
+    // Room compiler code generation is handled by KSP.
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
