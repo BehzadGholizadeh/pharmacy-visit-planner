@@ -8,11 +8,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
-import com.pharmacyvisit.driver.presentation.theme.PharmacyVisitDriverTheme
 import com.pharmacyvisit.driver.presentation.navigation.DriverNavHost
-import dagger.hilt.android.AndroidEntryPoint
+import com.pharmacyvisit.driver.presentation.theme.PharmacyVisitDriverTheme
 
-@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

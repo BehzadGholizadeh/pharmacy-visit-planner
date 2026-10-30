@@ -172,3 +172,22 @@ Before coding:
 Then implement in small, buildable increments. Keep the Phase 1 mock boundary intact. Do not modify the Python Visitor planner or introduce production integrations.
 
 **Final status:** Planning review complete; implementation is **not yet authorized from the uncorrected plan**.
+
+
+---
+
+## 7. Product Owner technical clarifications locked before Slice 1
+
+The Product Owner approved three additional constraints, now incorporated into the active architecture:
+
+1. **Warehouse preparation is separate mutable state.** `manifest_snapshots` contains identity/linkage only. Planned quantity is `expectedManifestQty` in `order_line_snapshots`. Actual warehouse `preparedQty` and lifecycle status are in `warehouse_preparation_state` and `warehouse_line_preparation_state`. Both preparation tables lock read-only when the route operational state becomes `ACTIVE`.
+2. **Previous-day timestamps are validated in Asia/Tehran.** For a new shift, serviceDate is today; finalizedAt's Tehran date is before serviceDate; downloadedAt's Tehran date is before serviceDate; and downloadedAt is not earlier than finalizedAt.
+3. **Debug data is physically isolated.** Operational data uses `driver_operational.db`; debug fixtures use `driver_debug_scenarios.db` (or an isolated in-memory database). Debug reset never clears operational data; a reset on a database with an ACTIVE shift is blocked. Explicitly selecting the isolated debug database does not touch an operational active shift.
+
+R1–R9 are considered incorporated into the locked Phase 1 technical specification. Slice 1 implementation has begun with Manual DI, domain contracts, the Tehran clock and dependency cleanup. This is a code-change status, not a claim that Gradle sync/build has been executed.
+
+## 8. Review disposition
+
+**Architecture: Approved for implementation under the locked technical decisions.**  
+**Slice 1: Committed to GitHub; local/CI build verification remains outstanding.**  
+**Slices 2–5: Not implemented by this commit.**

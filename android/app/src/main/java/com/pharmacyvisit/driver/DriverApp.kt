@@ -1,7 +1,16 @@
 package com.pharmacyvisit.driver
 
 import android.app.Application
-import dagger.hilt.android.HiltAndroidApp
+import com.pharmacyvisit.driver.di.AppContainer
+import com.pharmacyvisit.driver.di.DefaultAppContainer
 
-@HiltAndroidApp
-class DriverApp : Application()
+class DriverApp : Application() {
+
+    lateinit var appContainer: AppContainer
+        private set
+
+    override fun onCreate() {
+        super.onCreate()
+        appContainer = DefaultAppContainer(applicationContext)
+    }
+}
