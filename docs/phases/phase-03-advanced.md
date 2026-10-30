@@ -1,8 +1,3 @@
-# Phase 3 – Advanced Features
+# SUPERSEDED / Deferred
 
-- Home screen widget showing next stop + progress
-- Daily summary screen
-- Push notifications (FCM) for route changes
-- Real ETA using Google Directions or Neshan
-- Optional live location sharing (with permission)
-- Multi-day view (tomorrow’s plan)
+Advanced features (ETA, widgets, live location, etc.) are out of scope until Phase 1 and Phase 2 are complete. Live location remains explicitly out of scope for Phase 1 and Phase 2.
